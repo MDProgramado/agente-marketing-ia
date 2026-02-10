@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import random
-import threading
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
@@ -16,23 +15,16 @@ from sqlmodel import Field as DBField, SQLModel, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# --- SERVIDOR FALSO PARA O RENDER ---
-from http.server import HTTPServer, BaseHTTPRequestHandler
-
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Agente Rodando 100%")
-
-def start_fake_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    logger.info(f"🌍 Servidor Fake rodando na porta {port}")
-    server.serve_forever()
+# --- MOVIEPY: O Editor de Vídeo ---
+try:
+    # Tenta importar. Se falhar (localmente sem ffmpeg), o bot não quebra.
+    from moviepy.editor import ImageClip
+    HAS_VIDEO = True
+except ImportError:
+    HAS_VIDEO = False
+    logger.warning("⚠️ MoviePy não encontrado. O agente enviará apenas imagens.")
 
 # --- 1. CONFIGURAÇÃO ---
-
 class Settings(BaseSettings):
     serper_api_key: str
     openrouter_api_key: str  
@@ -46,7 +38,6 @@ settings = Settings()
 engine = create_async_engine(settings.database_url, echo=False)
 
 # --- 2. BANCO DE DADOS ---
-
 class SentProduct(SQLModel, table=True):
     id: Optional[int] = DBField(default=None, primary_key=True)
     product_name: str = DBField(index=True)
@@ -57,48 +48,62 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-# --- 3. ESTRUTURA DE DADOS OTIMIZADA ---
-
+# --- 3. MODELOS DE DADOS ---
 class ProductOpportunity(BaseModel):
-    product_name: str = Field(..., description="Nome comercial curto do produto.")
+    product_name: str = Field(..., description="Nome curto do produto.")
     virality_score: int = Field(..., ge=0, le=100)
     target_audience: str
-    pain_point_solved: str
-    
-    # SUGESTÃO B: Prompt Engineering embutido na tipagem
-    visual_prompt: str = Field(..., description="Prompt visual em INGLÊS. OBRIGATÓRIO incluir: 'Professional product photography, studio lighting, bokeh background, 8k resolution, cinematic shot'. Descreva o produto em uso.")
-    
     marketing_hook: str
+    visual_prompt: str = Field(..., description="Prompt visual em INGLÊS. Detalhado, cinematic, 8k.")
     hashtags: List[str]
-    
-    # SUGESTÃO A: Captura de URL para validação
-    source_url: Optional[str] = Field(None, description="A URL do produto encontrada na busca (Shopee, Amazon, etc).")
+    source_url: Optional[str] = Field(None, description="URL do produto se encontrada.")
 
 class MarketAnalysisResult(BaseModel):
     top_opportunities: List[ProductOpportunity]
     market_mood: Literal["Alta Demanda", "Saturado", "Emergente", "Estável"]
     strategy_advice: str
 
-# --- 4. LISTA DE NICHOS ---
+# --- 4. LISTA DE NICHOS (Rotação) ---
 NICHE_QUERIES = [
-    "acessórios setup gamer barato led rgb",
-    "gadgets produtividade home office shopee",
-    "suporte celular articulado mesa review",
-    "utensílios cozinha silicone viral tiktok",
-    "organizadores geladeira acrilico",
-    "mini processador alimentos eletrico portatil",
-    "mop giratorio limpeza pratica review",
-    "aspirador po portatil carro potente",
-    "massageador pescoço elétrico relaxamento",
-    "brinquedos interativos gatos laser"
+    "gadgets cozinha viral tiktok",
+    "acessórios setup gamer rgb barato",
+    "organizadores casa inteligentes",
+    "produtos limpeza satisfatoria",
+    "brinquedos pets interativos",
+    "ferramentas multifuncionais diy",
+    "acessórios carro viagem conforto"
 ]
 
-# --- 5. O AGENTE ---
+# --- 5. LÓGICA DE VÍDEO (Video Factory) ---
+def create_video_from_image(image_path: str, output_path: str):
+    """
+    Transforma uma imagem estática em um vídeo MP4 de 5 segundos.
+    Roda em Thread separada para não travar o bot.
+    """
+    if not HAS_VIDEO: return False
+    try:
+        # Cria um clipe de 5 segundos
+        clip = ImageClip(image_path).set_duration(5)
+        clip = clip.set_fps(24)
+        
+        # Renderiza (Preset ultrafast para economizar CPU do Railway)
+        clip.write_videofile(
+            output_path, 
+            codec="libx264", 
+            audio=False, 
+            preset="ultrafast",
+            threads=4,
+            logger=None # Silencia logs do ffmpeg
+        )
+        return True
+    except Exception as e:
+        logger.error(f"❌ Erro ao renderizar vídeo: {e}")
+        return False
 
+# --- 6. O AGENTE ---
 class MarketingAgent:
     def __init__(self):
-        # Timeouts maiores para evitar falsos negativos na validação de link
-        self.http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        self.http_client = httpx.AsyncClient(timeout=40.0, follow_redirects=True)
         self.reasoning_client = instructor.from_openai(
             AsyncOpenAI(
                 api_key=settings.openrouter_api_key,
@@ -109,46 +114,19 @@ class MarketingAgent:
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def search_trends(self, query: str) -> dict:
-        logger.info(f"🔍 [COLETA] Sondando Google Trends: '{query}'")
+        logger.info(f"🔍 [COLETA] Google Trends: '{query}'")
         url = "https://google.serper.dev/search"
-        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 10, "tbs": "qdr:m"})
+        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 8, "tbs": "qdr:m"})
         headers = {'X-API-KEY': settings.serper_api_key, 'Content-Type': 'application/json'}
-        
         response = await self.http_client.post(url, headers=headers, content=payload)
         response.raise_for_status()
         return response.json()
 
-    # SUGESTÃO A: Validação de URL (Sanity Check)
-    async def verify_url_integrity(self, url: str) -> bool:
-        """Verifica se o link realmente existe (Status 200)."""
-        if not url:
-            return True # Se não tem link, aprovamos a ideia (o usuário busca depois)
-        
-        logger.info(f"🛡️ Validando link: {url[:30]}...")
-        try:
-            # User-Agent é crucial para não ser bloqueado por Amazon/Shopee
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
-            response = await self.http_client.head(url, headers=headers)
-            
-            if response.status_code < 400:
-                return True
-            
-            # Alguns sites não aceitam HEAD, tentamos GET rápido
-            response = await self.http_client.get(url, headers=headers)
-            return response.status_code < 400
-            
-        except Exception as e:
-            logger.warning(f"⚠️ Link suspeito ou inacessível: {e}")
-            return False # Link quebrado? Descarta o produto.
-
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def analyze_market(self, search_data: dict) -> MarketAnalysisResult:
-        logger.info("🧠 [ANÁLISE] Raciocinando sobre os dados...")
+        logger.info("🧠 [ANÁLISE] Processando via LLM...")
         organic = search_data.get("organic", [])
-        if not organic:
-            return MarketAnalysisResult(top_opportunities=[], market_mood="Estável", strategy_advice="Sem dados.")
-
-        # ATUALIZAÇÃO: Injetamos o 'link' no texto para o LLM poder extrair
+        if not organic: return MarketAnalysisResult(top_opportunities=[], market_mood="Estável", strategy_advice="N/A")
+        
         snippets = "\n".join([f"- {item.get('title')} (Link: {item.get('link')}): {item.get('snippet')}" for item in organic])
         
         return await self.reasoning_client.chat.completions.create(
@@ -156,147 +134,127 @@ class MarketingAgent:
             response_model=MarketAnalysisResult,
             messages=[
                 {"role": "system", "content": "Você é um Caçador de Produtos Virais. Identifique produtos físicos."},
-                {"role": "user", "content": f"Analise estes resultados. Extraia o produto e a URL de venda se houver:\n{snippets}"}
+                {"role": "user", "content": f"Analise estes resultados. Extraia o produto e a URL de venda:\n{snippets}"}
             ],
         )
 
-    async def generate_viral_image(self, prompt: str) -> Optional[str]:
-        logger.info(f"🎨 [ARTE] Gerando imagem: {prompt[:30]}...")
+    async def process_media(self, prompt: str) -> tuple[Optional[str], Optional[str]]:
+        """Gera imagem e converte em vídeo."""
+        logger.info(f"🎨 [ASSET] Gerando mídia para: {prompt[:15]}...")
+        img_filename = f"temp_{random.randint(1000,9999)}.jpg"
+        vid_filename = f"video_{random.randint(1000,9999)}.mp4"
+        
         try:
+            # 1. Gera URL da Imagem (Pollinations)
             import urllib.parse
-            # SUGESTÃO B: Reforço no prompt via código também
-            enhanced_prompt = f"hyper realistic, 8k, bokeh, {prompt}"
-            encoded_prompt = urllib.parse.quote(enhanced_prompt)
-            image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-            return image_url
+            encoded = urllib.parse.quote(f"hyper realistic product photography, 8k, cinematic lighting, {prompt}")
+            image_url = f"https://image.pollinations.ai/prompt/{encoded}?width=1080&height=1350&nologo=true"
+            
+            # 2. Baixa a Imagem
+            resp = await self.http_client.get(image_url)
+            if resp.status_code == 200:
+                with open(img_filename, "wb") as f:
+                    f.write(resp.content)
+                
+                # 3. Converte para Vídeo (em thread separada)
+                loop = asyncio.get_running_loop()
+                success = await loop.run_in_executor(None, create_video_from_image, img_filename, vid_filename)
+                
+                if success:
+                    return image_url, vid_filename
+                
+                # Se falhar o vídeo, retorna só a imagem local (ou limpa ela)
+                if os.path.exists(img_filename): os.remove(img_filename)
+            
+            return image_url, None
         except Exception as e:
-            logger.error(f"⚠️ Falha na imagem: {e}")
-            return None
+            logger.error(f"⚠️ Erro de mídia: {e}")
+            return None, None
 
-    async def check_memory(self, product_name: str) -> bool:
-        async with AsyncSession(engine) as session:
-            statement = select(SentProduct).where(
-                SentProduct.product_name == product_name,
-                SentProduct.sent_at > datetime.now(timezone.utc) - timedelta(days=7)
-            )
-            result = await session.execute(statement)
-            if result.scalars().first():
-                logger.info(f"🚫 [MEMÓRIA] '{product_name}' já foi recomendado recentemente.")
-                return True
-            return False
-
-    async def save_to_memory(self, product: ProductOpportunity):
-        async with AsyncSession(engine) as session:
-            entry = SentProduct(
-                product_name=product.product_name,
-                virality_score=product.virality_score,
-                sent_at=datetime.now(timezone.utc)
-            )
-            session.add(entry)
-            await session.commit()
-
-    async def send_alert(self, product: ProductOpportunity, image_url: str = None):
+    async def send_alert(self, product: ProductOpportunity, image_url: str, video_path: str):
         base_url = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
-        
-        # Link clicável se existir
-        link_text = f"\n🔗 [Ver Produto]({product.source_url})" if product.source_url else ""
-        
+        link = f"\n🔗 [Ver Oferta]({product.source_url})" if product.source_url else ""
         caption = (
-            f"🔥 **{product.product_name.upper()}** (Score: {product.virality_score})\n\n"
-            f"🎯 **Público:** {product.target_audience}\n"
-            f"💡 **Hook:** {product.marketing_hook}\n"
+            f"🎬 **{product.product_name.upper()}**\n"
+            f"🔥 Score: {product.virality_score}/100\n\n"
+            f"🎯 {product.marketing_hook}\n"
             f"🏷️ `{' '.join(product.hashtags[:5])}`"
-            f"{link_text}"
+            f"{link}"
         )
+        
         try:
-            if image_url:
+            if video_path and os.path.exists(video_path):
+                logger.info("📤 Enviando VÍDEO para o Telegram...")
+                with open(video_path, "rb") as v:
+                    await self.http_client.post(
+                        f"{base_url}/sendVideo",
+                        data={"chat_id": settings.telegram_chat_id, "caption": caption, "parse_mode": "Markdown"},
+                        files={"video": v},
+                        timeout=120.0 # Upload de vídeo demora mais
+                    )
+                # Limpa o arquivo de vídeo após envio
+                os.remove(video_path)
+            elif image_url:
+                logger.info("📤 Enviando IMAGEM (Fallback)...")
                 await self.http_client.post(
                     f"{base_url}/sendPhoto",
                     json={"chat_id": settings.telegram_chat_id, "photo": image_url, "caption": caption, "parse_mode": "Markdown"}
                 )
-            else:
-                await self.http_client.post(
-                    f"{base_url}/sendMessage",
-                    json={"chat_id": settings.telegram_chat_id, "text": caption, "parse_mode": "Markdown"}
-                )
-            logger.success(f"✅ Alerta enviado: {product.product_name}")
-        except Exception as e:
-            logger.error(f"Erro no Telegram: {e}")
-
-    async def send_weekly_report(self):
-        logger.info("📅 Gerando Relatório Semanal...")
-        async with AsyncSession(engine) as session:
-            seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
-            statement = (
-                select(SentProduct)
-                .where(SentProduct.sent_at >= seven_days_ago)
-                .order_by(desc(SentProduct.virality_score))
-                .limit(5)
-            )
-            result = await session.execute(statement)
-            top_products = result.scalars().all()
-
-            if not top_products:
-                return
-
-            msg = "🏆 **TOP 5 DA SEMANA** 🏆\n\n"
-            for i, p in enumerate(top_products, 1):
-                msg += f"{i}️⃣ **{p.product_name}** ({p.virality_score}/100)\n"
             
-            await self.http_client.post(
-                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
-                json={"chat_id": settings.telegram_chat_id, "text": msg, "parse_mode": "Markdown"}
-            )
+            # Limpa imagem temporária se sobrou
+            for f in os.listdir():
+                if f.startswith("temp_") and f.endswith(".jpg"):
+                    try: os.remove(f)
+                    except: pass
+                    
+            logger.success(f"✅ Enviado: {product.product_name}")
+        except Exception as e:
+            logger.error(f"Erro Telegram: {e}")
+
+    async def check_memory(self, product_name: str) -> bool:
+        async with AsyncSession(engine) as session:
+            result = await session.execute(select(SentProduct).where(SentProduct.product_name == product_name))
+            if result.scalars().first():
+                logger.info(f"🚫 [SKIP] Já enviado: {product_name}")
+                return True
+            return False
+
+    async def save_memory(self, product: ProductOpportunity):
+        async with AsyncSession(engine) as session:
+            session.add(SentProduct(product_name=product.product_name, virality_score=product.virality_score))
+            await session.commit()
 
     async def run(self):
-        current_query = random.choice(NICHE_QUERIES)
-        logger.info(f"🎲 Sorteio do Ciclo: '{current_query}'")
-        
+        topic = random.choice(NICHE_QUERIES)
+        logger.info(f"🎲 Sorteio: {topic}")
         try:
-            data = await self.search_trends(current_query)
-        except Exception as e:
-            logger.error(f"Falha na busca Serper: {e}")
-            return
-
-        analysis = await self.analyze_market(data)
-        logger.info(f"📊 Encontradas {len(analysis.top_opportunities)} oportunidades.")
-
-        for item in analysis.top_opportunities:
-            # 1. Memória
-            if await self.check_memory(item.product_name):
-                continue
+            data = await self.search_trends(topic)
+            analysis = await self.analyze_market(data)
             
-            # 2. Score
-            if item.virality_score < 75:
-                continue
-
-            # 3. NOVO: Validação de Link
-            if item.source_url:
-                is_valid = await self.verify_url_integrity(item.source_url)
-                if not is_valid:
-                    logger.warning(f"❌ Link quebrado detectado para {item.product_name}. Pulando...")
-                    continue
-
-            # 4. Ação
-            img_url = await self.generate_viral_image(item.visual_prompt)
-            await self.send_alert(item, img_url)
-            await self.save_to_memory(item)
-            await asyncio.sleep(5)
+            for item in analysis.top_opportunities:
+                if await self.check_memory(item.product_name): continue
+                if item.virality_score < 75: continue
+                
+                # Gera Imagem e Tenta Vídeo
+                img_url, vid_path = await self.process_media(item.visual_prompt)
+                
+                await self.send_alert(item, img_url, vid_path)
+                await self.save_memory(item)
+                await asyncio.sleep(5)
+                
+        except Exception as e:
+            logger.error(f"Falha no ciclo: {e}")
 
     async def start_loop(self):
         await init_db()
-        logger.info("🚀 SISTEMA OPERACIONAL - MONITORANDO 24/7")
-        # await self.send_weekly_report() # Descomente se quiser relatório ao iniciar
-        
+        logger.info("🚀 AGENTE DE VÍDEO (RAILWAY) - ATIVO")
         while True:
             await self.run()
-            logger.info("💤 Standby por 6 horas...")
+            logger.info("💤 Dormindo 6h...")
             await asyncio.sleep(6 * 3600)
 
 if __name__ == "__main__":
-    threading.Thread(target=start_fake_server, daemon=True).start()
     try:
-        agent = MarketingAgent()
-        asyncio.run(agent.start_loop())
+        asyncio.run(MarketingAgent().start_loop())
     except KeyboardInterrupt:
-        logger.warning("Sistema desligado manualmente.")
+        pass

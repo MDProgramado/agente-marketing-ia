@@ -1,24 +1,27 @@
-# Usa uma imagem Python 3.12 leve e segura
+# Usa Python 3.12 Slim (Leve e Rápido)
 FROM python:3.12-slim
 
-# Define variáveis de ambiente para o Python não criar arquivos .pyc e logs aparecerem na hora
+# Variáveis para otimizar o Python no Container
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Cria a pasta de trabalho dentro do container
 WORKDIR /app
 
-# Instala ferramentas básicas do sistema (necessário para algumas libs)
-RUN apt-get update && apt-get install -y --no-install-recommends gcc && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+# --- AQUI ESTÁ O SEGREDO: Instalamos o FFmpeg ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    ffmpeg \
+    libsm6 \
+    libxext6 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copia o arquivo de dependências e instala
+# Instala as dependências do Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia todo o seu código para dentro do container
+# Copia o código
 COPY . .
 
-# Comando para iniciar o agente
+# Inicia o Agente
 CMD ["python", "main.py"]
