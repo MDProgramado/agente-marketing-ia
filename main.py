@@ -1,5 +1,8 @@
 import asyncio
 import json
+import os
+import random  # <--- NOVO: Para sortear os nichos
+import threading
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
@@ -9,16 +12,30 @@ from loguru import logger
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from sqlmodel import Field as DBField, SQLModel, select
+from sqlmodel import Field as DBField, SQLModel, select, desc
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-# --- 1. CONFIGURAÇÃO & SEGURANÇA ---
+# --- SERVIDOR FALSO PARA O RENDER ---
+from http.server import HTTPServer, BaseHTTPRequestHandler
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Agente Rodando 100%")
+
+def start_fake_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+    logger.info(f"🌍 Servidor Fake rodando na porta {port}")
+    server.serve_forever()
+
+# --- 1. CONFIGURAÇÃO ---
 
 class Settings(BaseSettings):
     serper_api_key: str
     openrouter_api_key: str  
-    # openai_api_key removida para evitar erro de validação
     telegram_bot_token: str
     telegram_chat_id: str
     database_url: str = "sqlite+aiosqlite:///marketing_agent.db"
@@ -26,30 +43,28 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
 settings = Settings()
-
 engine = create_async_engine(settings.database_url, echo=False)
 
-# --- 2. CAMADA DE DADOS (Persistência) ---
+# --- 2. BANCO DE DADOS ---
 
 class SentProduct(SQLModel, table=True):
     id: Optional[int] = DBField(default=None, primary_key=True)
     product_name: str = DBField(index=True)
     virality_score: int
-    # Correção do warning de datetime: Usando UTC explicitamente
     sent_at: datetime = DBField(default_factory=lambda: datetime.now(timezone.utc))
 
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-# --- 3. MODELAGEM SEMÂNTICA ---
+# --- 3. ESTRUTURA DE DADOS ---
 
 class ProductOpportunity(BaseModel):
     product_name: str = Field(..., description="Nome comercial curto do produto.")
     virality_score: int = Field(..., ge=0, le=100)
     target_audience: str
     pain_point_solved: str
-    visual_prompt: str = Field(..., description="Prompt detalhado em INGLÊS para DALL-E 3.")
+    visual_prompt: str = Field(..., description="Prompt detalhado em INGLÊS para imagem.")
     marketing_hook: str
     hashtags: List[str]
 
@@ -58,12 +73,43 @@ class MarketAnalysisResult(BaseModel):
     market_mood: Literal["Alta Demanda", "Saturado", "Emergente", "Estável"]
     strategy_advice: str
 
-# --- 4. O AGENTE SUPERIOR ---
+# --- 4. LISTA DE NICHOS PODEROSOS (O "Banho de Loja") ---
+# O agente vai sortear um destes a cada ciclo para variar o conteúdo
+
+NICHE_QUERIES = [
+    # Tech & Gamer
+    "acessórios setup gamer barato led rgb",
+    "gadgets produtividade home office shopee",
+    "suporte celular articulado mesa review",
+    "mini teclado mecanico custo beneficio",
+    
+    # Casa & Cozinha (Alta Viralidade)
+    "utensílios cozinha silicone viral tiktok",
+    "organizadores geladeira acrilico",
+    "mini processador alimentos eletrico portatil",
+    "garrafa termica inteligente display led",
+    
+    # Limpeza & Organização
+    "mop giratorio limpeza pratica review",
+    "aspirador po portatil carro potente",
+    "organizadores cabos fios mesa",
+    
+    # Saúde & Beleza
+    "massageador pescoço elétrico relaxamento",
+    "removedor cravos vacuo eletrico",
+    "escova secadora alisadora viral",
+    
+    # Pets
+    "brinquedos interativos gatos laser",
+    "cama pet nuvem antiestresse",
+    "bebedouro fonte gatos automatico"
+]
+
+# --- 5. O AGENTE ---
 
 class MarketingAgent:
     def __init__(self):
         self.http_client = httpx.AsyncClient(timeout=60.0)
-        
         self.reasoning_client = instructor.from_openai(
             AsyncOpenAI(
                 api_key=settings.openrouter_api_key,
@@ -71,18 +117,12 @@ class MarketingAgent:
             ),
             mode=instructor.Mode.JSON
         )
-        
-        # Cliente Visual usando OpenRouter
-        self.visual_client = AsyncOpenAI(
-            api_key=settings.openrouter_api_key, 
-            base_url="https://openrouter.ai/api/v1"
-        ) 
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
     async def search_trends(self, query: str) -> dict:
-        logger.info(f"🔍 [COLETA] Sondando Google Trends: {query}")
+        logger.info(f"🔍 [COLETA] Sondando Google Trends: '{query}'")
         url = "https://google.serper.dev/search"
-        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 8, "tbs": "qdr:w"})
+        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 10, "tbs": "qdr:m"}) # qdr:m = último mês (melhor para nichos específicos)
         headers = {'X-API-KEY': settings.serper_api_key, 'Content-Type': 'application/json'}
         
         response = await self.http_client.post(url, headers=headers, content=payload)
@@ -102,46 +142,30 @@ class MarketingAgent:
             model="openai/gpt-4o-mini",
             response_model=MarketAnalysisResult,
             messages=[
-                {"role": "system", "content": "Você é um Diretor de Marketing Viral. Identifique produtos físicos."},
+                {"role": "system", "content": "Você é um Caçador de Produtos Virais. Identifique produtos físicos com alto potencial de venda na Shopee/Amazon."},
                 {"role": "user", "content": f"Analise estes resultados de busca e encontre produtos vencedores:\n{snippets}"}
             ],
         )
 
-   # ... (resto do código acima)
-
     async def generate_viral_image(self, prompt: str) -> Optional[str]:
-        """
-        Gera imagem usando Pollinations AI (Gratuito/Rápido) 
-        para contornar limitações de imagem da OpenRouter.
-        """
-        logger.info(f"🎨 [ARTE] Gerando imagem via Pollinations: {prompt[:30]}...")
+        logger.info(f"🎨 [ARTE] Gerando imagem: {prompt[:30]}...")
         try:
-            # Truque de Engenharia: Codificamos o prompt na URL
-            # Isso gera uma imagem na hora, sem precisar de API Key complexa
             import urllib.parse
-            encoded_prompt = urllib.parse.quote(f"product photography, 8k, cinematic lighting, {prompt}")
-            
-            # Retorna a URL direta. O Telegram vai baixar e mostrar automaticamente.
+            encoded_prompt = urllib.parse.quote(f"hyper realistic product photography, 8k, cinematic lighting, {prompt}")
             image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
-            
             return image_url
         except Exception as e:
-            logger.error(f"⚠️ Falha na geração de imagem: {e}")
+            logger.error(f"⚠️ Falha na imagem: {e}")
             return None
 
-    # ... (resto do código abaixo)
     async def check_memory(self, product_name: str) -> bool:
-        """Verifica se o produto já foi enviado."""
         async with AsyncSession(engine) as session:
-            # Correção aqui: Usando execute() e scalars()
             statement = select(SentProduct).where(
                 SentProduct.product_name == product_name,
                 SentProduct.sent_at > datetime.now(timezone.utc) - timedelta(days=7)
             )
             result = await session.execute(statement)
-            existing = result.scalars().first()
-            
-            if existing:
+            if result.scalars().first():
                 logger.info(f"🚫 [MEMÓRIA] '{product_name}' já foi recomendado recentemente.")
                 return True
             return False
@@ -180,10 +204,41 @@ class MarketingAgent:
         except Exception as e:
             logger.error(f"Erro no Telegram: {e}")
 
+    async def send_weekly_report(self):
+        logger.info("📅 Gerando Relatório Semanal...")
+        async with AsyncSession(engine) as session:
+            seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
+            statement = (
+                select(SentProduct)
+                .where(SentProduct.sent_at >= seven_days_ago)
+                .order_by(desc(SentProduct.virality_score))
+                .limit(5)
+            )
+            result = await session.execute(statement)
+            top_products = result.scalars().all()
+
+            if not top_products:
+                logger.info("⚠️ Sem dados para relatório semanal.")
+                return
+
+            msg = "🏆 **TOP 5 DA SEMANA** 🏆\n\n"
+            for i, p in enumerate(top_products, 1):
+                msg += f"{i}️⃣ **{p.product_name}** ({p.virality_score}/100)\n"
+            
+            await self.http_client.post(
+                f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
+                json={"chat_id": settings.telegram_chat_id, "text": msg, "parse_mode": "Markdown"}
+            )
+            logger.success("✅ Relatório Semanal Enviado!")
+
     async def run(self):
-        logger.info("🕵️ Agente Iniciando Varredura...")
+        # --- AQUI ESTÁ A MÁGICA ---
+        # Sorteia um nicho diferente a cada execução
+        current_query = random.choice(NICHE_QUERIES)
+        logger.info(f"🎲 Sorteio do Ciclo: '{current_query}'")
+        
         try:
-            data = await self.search_trends("produtos virais tiktok shopee brasil gadgets tech")
+            data = await self.search_trends(current_query)
         except Exception as e:
             logger.error(f"Falha na busca Serper: {e}")
             return
@@ -192,32 +247,29 @@ class MarketingAgent:
         logger.info(f"📊 Encontradas {len(analysis.top_opportunities)} oportunidades.")
 
         for item in analysis.top_opportunities:
-            # 1. Verifica Memória
             if await self.check_memory(item.product_name):
                 continue
-            
-            # 2. Filtra Score Baixo
             if item.virality_score < 75:
                 continue
 
-            # 3. Gera Imagem
             img_url = await self.generate_viral_image(item.visual_prompt)
-            
-            # 4. Envia e Salva
             await self.send_alert(item, img_url)
             await self.save_to_memory(item)
-            
             await asyncio.sleep(5)
 
     async def start_loop(self):
         await init_db()
         logger.info("🚀 SISTEMA OPERACIONAL - MONITORANDO 24/7")
+        # Envia relatório ao iniciar (teste)
+        await self.send_weekly_report()
+        
         while True:
             await self.run()
             logger.info("💤 Standby por 6 horas...")
             await asyncio.sleep(6 * 3600)
 
 if __name__ == "__main__":
+    threading.Thread(target=start_fake_server, daemon=True).start()
     try:
         agent = MarketingAgent()
         asyncio.run(agent.start_loop())
