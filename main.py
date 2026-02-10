@@ -1,7 +1,7 @@
 import asyncio
 import json
 import os
-import random  # <--- NOVO: Para sortear os nichos
+import random
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
@@ -57,59 +57,48 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(SQLModel.metadata.create_all)
 
-# --- 3. ESTRUTURA DE DADOS ---
+# --- 3. ESTRUTURA DE DADOS OTIMIZADA ---
 
 class ProductOpportunity(BaseModel):
     product_name: str = Field(..., description="Nome comercial curto do produto.")
     virality_score: int = Field(..., ge=0, le=100)
     target_audience: str
     pain_point_solved: str
-    visual_prompt: str = Field(..., description="Prompt detalhado em INGLÊS para imagem.")
+    
+    # SUGESTÃO B: Prompt Engineering embutido na tipagem
+    visual_prompt: str = Field(..., description="Prompt visual em INGLÊS. OBRIGATÓRIO incluir: 'Professional product photography, studio lighting, bokeh background, 8k resolution, cinematic shot'. Descreva o produto em uso.")
+    
     marketing_hook: str
     hashtags: List[str]
+    
+    # SUGESTÃO A: Captura de URL para validação
+    source_url: Optional[str] = Field(None, description="A URL do produto encontrada na busca (Shopee, Amazon, etc).")
 
 class MarketAnalysisResult(BaseModel):
     top_opportunities: List[ProductOpportunity]
     market_mood: Literal["Alta Demanda", "Saturado", "Emergente", "Estável"]
     strategy_advice: str
 
-# --- 4. LISTA DE NICHOS PODEROSOS (O "Banho de Loja") ---
-# O agente vai sortear um destes a cada ciclo para variar o conteúdo
-
+# --- 4. LISTA DE NICHOS ---
 NICHE_QUERIES = [
-    # Tech & Gamer
     "acessórios setup gamer barato led rgb",
     "gadgets produtividade home office shopee",
     "suporte celular articulado mesa review",
-    "mini teclado mecanico custo beneficio",
-    
-    # Casa & Cozinha (Alta Viralidade)
     "utensílios cozinha silicone viral tiktok",
     "organizadores geladeira acrilico",
     "mini processador alimentos eletrico portatil",
-    "garrafa termica inteligente display led",
-    
-    # Limpeza & Organização
     "mop giratorio limpeza pratica review",
     "aspirador po portatil carro potente",
-    "organizadores cabos fios mesa",
-    
-    # Saúde & Beleza
     "massageador pescoço elétrico relaxamento",
-    "removedor cravos vacuo eletrico",
-    "escova secadora alisadora viral",
-    
-    # Pets
-    "brinquedos interativos gatos laser",
-    "cama pet nuvem antiestresse",
-    "bebedouro fonte gatos automatico"
+    "brinquedos interativos gatos laser"
 ]
 
 # --- 5. O AGENTE ---
 
 class MarketingAgent:
     def __init__(self):
-        self.http_client = httpx.AsyncClient(timeout=60.0)
+        # Timeouts maiores para evitar falsos negativos na validação de link
+        self.http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         self.reasoning_client = instructor.from_openai(
             AsyncOpenAI(
                 api_key=settings.openrouter_api_key,
@@ -122,12 +111,35 @@ class MarketingAgent:
     async def search_trends(self, query: str) -> dict:
         logger.info(f"🔍 [COLETA] Sondando Google Trends: '{query}'")
         url = "https://google.serper.dev/search"
-        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 10, "tbs": "qdr:m"}) # qdr:m = último mês (melhor para nichos específicos)
+        payload = json.dumps({"q": query, "gl": "br", "hl": "pt-br", "num": 10, "tbs": "qdr:m"})
         headers = {'X-API-KEY': settings.serper_api_key, 'Content-Type': 'application/json'}
         
         response = await self.http_client.post(url, headers=headers, content=payload)
         response.raise_for_status()
         return response.json()
+
+    # SUGESTÃO A: Validação de URL (Sanity Check)
+    async def verify_url_integrity(self, url: str) -> bool:
+        """Verifica se o link realmente existe (Status 200)."""
+        if not url:
+            return True # Se não tem link, aprovamos a ideia (o usuário busca depois)
+        
+        logger.info(f"🛡️ Validando link: {url[:30]}...")
+        try:
+            # User-Agent é crucial para não ser bloqueado por Amazon/Shopee
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"}
+            response = await self.http_client.head(url, headers=headers)
+            
+            if response.status_code < 400:
+                return True
+            
+            # Alguns sites não aceitam HEAD, tentamos GET rápido
+            response = await self.http_client.get(url, headers=headers)
+            return response.status_code < 400
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Link suspeito ou inacessível: {e}")
+            return False # Link quebrado? Descarta o produto.
 
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
     async def analyze_market(self, search_data: dict) -> MarketAnalysisResult:
@@ -136,14 +148,15 @@ class MarketingAgent:
         if not organic:
             return MarketAnalysisResult(top_opportunities=[], market_mood="Estável", strategy_advice="Sem dados.")
 
-        snippets = "\n".join([f"- {item.get('title')}: {item.get('snippet')}" for item in organic])
+        # ATUALIZAÇÃO: Injetamos o 'link' no texto para o LLM poder extrair
+        snippets = "\n".join([f"- {item.get('title')} (Link: {item.get('link')}): {item.get('snippet')}" for item in organic])
         
         return await self.reasoning_client.chat.completions.create(
             model="openai/gpt-4o-mini",
             response_model=MarketAnalysisResult,
             messages=[
-                {"role": "system", "content": "Você é um Caçador de Produtos Virais. Identifique produtos físicos com alto potencial de venda na Shopee/Amazon."},
-                {"role": "user", "content": f"Analise estes resultados de busca e encontre produtos vencedores:\n{snippets}"}
+                {"role": "system", "content": "Você é um Caçador de Produtos Virais. Identifique produtos físicos."},
+                {"role": "user", "content": f"Analise estes resultados. Extraia o produto e a URL de venda se houver:\n{snippets}"}
             ],
         )
 
@@ -151,7 +164,9 @@ class MarketingAgent:
         logger.info(f"🎨 [ARTE] Gerando imagem: {prompt[:30]}...")
         try:
             import urllib.parse
-            encoded_prompt = urllib.parse.quote(f"hyper realistic product photography, 8k, cinematic lighting, {prompt}")
+            # SUGESTÃO B: Reforço no prompt via código também
+            enhanced_prompt = f"hyper realistic, 8k, bokeh, {prompt}"
+            encoded_prompt = urllib.parse.quote(enhanced_prompt)
             image_url = f"https://image.pollinations.ai/prompt/{encoded_prompt}?width=1024&height=1024&nologo=true"
             return image_url
         except Exception as e:
@@ -182,12 +197,16 @@ class MarketingAgent:
 
     async def send_alert(self, product: ProductOpportunity, image_url: str = None):
         base_url = f"https://api.telegram.org/bot{settings.telegram_bot_token}"
+        
+        # Link clicável se existir
+        link_text = f"\n🔗 [Ver Produto]({product.source_url})" if product.source_url else ""
+        
         caption = (
             f"🔥 **{product.product_name.upper()}** (Score: {product.virality_score})\n\n"
             f"🎯 **Público:** {product.target_audience}\n"
-            f"💡 **Estratégia:** {product.marketing_hook}\n"
-            f"⚠️ **Resolve:** {product.pain_point_solved}\n\n"
+            f"💡 **Hook:** {product.marketing_hook}\n"
             f"🏷️ `{' '.join(product.hashtags[:5])}`"
+            f"{link_text}"
         )
         try:
             if image_url:
@@ -218,7 +237,6 @@ class MarketingAgent:
             top_products = result.scalars().all()
 
             if not top_products:
-                logger.info("⚠️ Sem dados para relatório semanal.")
                 return
 
             msg = "🏆 **TOP 5 DA SEMANA** 🏆\n\n"
@@ -229,11 +247,8 @@ class MarketingAgent:
                 f"https://api.telegram.org/bot{settings.telegram_bot_token}/sendMessage",
                 json={"chat_id": settings.telegram_chat_id, "text": msg, "parse_mode": "Markdown"}
             )
-            logger.success("✅ Relatório Semanal Enviado!")
 
     async def run(self):
-        # --- AQUI ESTÁ A MÁGICA ---
-        # Sorteia um nicho diferente a cada execução
         current_query = random.choice(NICHE_QUERIES)
         logger.info(f"🎲 Sorteio do Ciclo: '{current_query}'")
         
@@ -247,11 +262,22 @@ class MarketingAgent:
         logger.info(f"📊 Encontradas {len(analysis.top_opportunities)} oportunidades.")
 
         for item in analysis.top_opportunities:
+            # 1. Memória
             if await self.check_memory(item.product_name):
                 continue
+            
+            # 2. Score
             if item.virality_score < 75:
                 continue
 
+            # 3. NOVO: Validação de Link
+            if item.source_url:
+                is_valid = await self.verify_url_integrity(item.source_url)
+                if not is_valid:
+                    logger.warning(f"❌ Link quebrado detectado para {item.product_name}. Pulando...")
+                    continue
+
+            # 4. Ação
             img_url = await self.generate_viral_image(item.visual_prompt)
             await self.send_alert(item, img_url)
             await self.save_to_memory(item)
@@ -260,8 +286,7 @@ class MarketingAgent:
     async def start_loop(self):
         await init_db()
         logger.info("🚀 SISTEMA OPERACIONAL - MONITORANDO 24/7")
-        # Envia relatório ao iniciar (teste)
-        await self.send_weekly_report()
+        # await self.send_weekly_report() # Descomente se quiser relatório ao iniciar
         
         while True:
             await self.run()
